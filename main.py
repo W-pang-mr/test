@@ -4,6 +4,27 @@ import requests
 TOKEN = os.environ["BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 
+KEYBOARD = {
+    "keyboard": [["سلام"]],
+    "resize_keyboard": True,
+    "one_time_keyboard": False,
+}
+
+
+def send_message(chat_id, text, reply_markup=None):
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+
+    requests.post(
+        f"{API}/sendMessage",
+        json=data,
+        timeout=10,
+    )
+
 
 def main():
     offset = 0
@@ -13,31 +34,25 @@ def main():
             f"{API}/getUpdates",
             params={
                 "offset": offset,
-                "timeout": 30
+                "timeout": 30,
             },
-            timeout=35
+            timeout=35,
         )
-
         data = response.json()
 
         for update in data.get("result", []):
             offset = update["update_id"] + 1
-
             message = update.get("message")
             if not message:
                 continue
 
-            if message.get("text") == "/start":
-                chat_id = message["chat"]["id"]
+            text = message.get("text")
+            chat_id = message["chat"]["id"]
 
-                requests.post(
-                    f"{API}/sendMessage",
-                    data={
-                        "chat_id": chat_id,
-                        "text": "سلام رفیق 👋"
-                    },
-                    timeout=10
-                )
+            if text == "/start":
+                send_message(chat_id, "سلام 👋", KEYBOARD)
+            elif text == "سلام":
+                send_message(chat_id, "سلام 👋", KEYBOARD)
 
 
 if __name__ == "__main__":
