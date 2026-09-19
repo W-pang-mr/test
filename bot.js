@@ -129,11 +129,11 @@ async function ton(method, params) {
 }
 
 async function fetchTonPrice() {
-    if (Date.now() - lastPriceFetch < 5 * 60 * 1000 && tonPriceUsd > 0) return tonPriceUsd;
+    if (Date.now() - lastPriceFetch < 60 * 1000 && tonPriceUsd > 0) return tonPriceUsd;
     try {
-        const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd');
+        const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT');
         const j = await r.json();
-        tonPriceUsd = j['the-open-network']?.usd || 0;
+        tonPriceUsd = parseFloat(j.price) || 0;
         lastPriceFetch = Date.now();
     } catch (e) {
         console.error('price fetch failed', e.message);
@@ -382,7 +382,12 @@ async function showBalances(chatId) {
     }
 
     await fetchTonPrice();
-    let text = '💰 <b>Balances</b>\n\n';
+    let text = '💰 <b>Balances</b>\n';
+    if (tonPriceUsd > 0) {
+        text += '📈 TON Price: <b>$' + tonPriceUsd.toFixed(4) + '</b> (Binance)\n\n';
+    } else {
+        text += '\n';
+    }
     for (const key of keys) {
         try {
             const bal = await ton('getAddressBalance', { address: state.addrs[key].raw });
@@ -596,7 +601,6 @@ async function pollLoop() {
         const t0 = Date.now();
         try {
             await pollOnce();
-            // Check daily summary every ~30 minutes
             if (Date.now() - lastDailyCheck > 30 * 60 * 1000) {
                 await checkDailySummaries();
                 lastDailyCheck = Date.now();
