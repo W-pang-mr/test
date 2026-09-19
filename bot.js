@@ -1,16 +1,16 @@
 'use strict';
 /*
- * ربات اعلان تراکنش TON (شیشه ولت)
- * - هر وقت TON به آدرس ولت برسد یا از آن ارسال شود، در تلگرام پیام می‌دهد.
- * - بدون هیچ کتابخانه‌ی اضافه (فقط Node 18 یا بالاتر).
- * - ذخیره‌سازی: Firebase Realtime Database (اگر تنظیم شود) وگرنه فایل data.json
+ * TON Wallet Notifier Bot
+ * - Sends Telegram notifications when TON is received or sent from watched wallets.
+ * - Zero dependencies (Node 18+).
+ * - Storage: Firebase Realtime Database (optional) or local data.json
  *
  * Environment Variables:
- *   BOT_TOKEN          (اجباری) توکن ربات از BotFather
- *   FIREBASE_DB_URL    (اختیاری) مثلاً https://xxxx-default-rtdb.firebaseio.com
- *   FIREBASE_SECRET    (اختیاری) Database Secret برای دسترسی نوشتن
- *   TONCENTER_API_KEY  (اختیاری) کلید از @tonapibot برای سرعت بیشتر
- *   POLL_MS            (اختیاری) فاصله‌ی بررسی تراکنش‌ها، پیش‌فرض 12000
+ *   BOT_TOKEN          (required) Bot token from @BotFather
+ *   FIREBASE_DB_URL    (optional) e.g. https://xxxx-default-rtdb.firebaseio.com
+ *   FIREBASE_SECRET    (optional) Database secret for write access
+ *   TONCENTER_API_KEY  (optional) API key from @tonapibot for higher rate limits
+ *   POLL_MS            (optional) Polling interval in ms, default 12000
  */
 
 const http = require('http');
@@ -25,7 +25,7 @@ const PORT = Number(process.env.PORT || 3000);
 const DATA_FILE = process.env.DATA_FILE || './data.json';
 const TONCENTER = 'https://toncenter.com/api/v2';
 
-// ---------- ابزارها ----------
+// ---------- helpers ----------
 function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
 function esc(s) {
@@ -47,9 +47,9 @@ function formatTon(nano) {
     return frac ? whole + '.' + frac : String(whole);
 }
 
-// ---------- وضعیت (اشتراک‌ها) ----------
-// subs[chatId][key] = آدرس نمایشی ولت
-// addrs[key] = { raw, lastLt }   (key = آدرس raw که ':' آن به '_' تبدیل شده)
+// ---------- state ----------
+// subs[chatId][key] = display address
+// addrs[key] = { raw, lastLt }
 let state = { subs: {}, addrs: {} };
 let dirty = false;
 let saving = Promise.resolve();
@@ -61,7 +61,6 @@ function dbUrl() {
 async function loadState() {
     let data = null;
     if (FIREBASE_DB_URL) {
-        // اگر بارگذاری از Firebase خطا بدهد، عمداً خطا می‌دهیم تا داده‌ی قبلی با حالت خالی بازنویسی نشود
         const r = await fetch(dbUrl());
         if (!r.ok) throw new Error('Firebase load failed: ' + r.status);
         data = await r.json();
@@ -103,7 +102,7 @@ async function ton(method, params) {
     throw new Error('toncenter rate limited');
 }
 
-// ---------- تلگرام ----------
+// ---------- Telegram ----------
 async function tg(method, params) {
     const r = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/' + method, {
         method: 'POST',
@@ -119,8 +118,28 @@ async function tg(method, params) {
     return j.result;
 }
 
-function send(chatId, text) {
-    return tg('sendMessage', { chat_id: chatId, text: text, parse_mode: 'HTML', disable_web_page_preview: true });
+function mainKeyboard() {
+    return {
+        inline_keyboard: [
+            [{ text: '📋 My Active Addresses', callback_data: 'my_addresses' }],
+            [{ text: '🔕 Stop All Alerts', callback_data: 'stop_all' }]
+        ]
+    };
+}
+
+function send(chatId, text, extra) {
+    const payload = {
+        chat_id: chatId,
+        text: text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true
+    };
+    if (extra && extra.reply_markup) payload.reply_markup = extra.reply_markup;
+    return tg('sendMessage', payload);
+}
+
+function answerCallback(id, text) {
+    return tg('answerCallbackQuery', { callback_query_id: id, text: text || '' }).catch(function () { });
 }
 
 async function notify(chatId, text) {
@@ -128,7 +147,6 @@ async function notify(chatId, text) {
         await send(chatId, text);
     } catch (e) {
         if (e.code === 403) {
-            // کاربر ربات را بلاک کرده؛ اشتراک‌هایش را حذف می‌کنیم
             delete state.subs[chatId];
             dirty = true;
         } else {
@@ -137,7 +155,7 @@ async function notify(chatId, text) {
     }
 }
 
-// ---------- ساخت متن اعلان ----------
+// ---------- build notification text ----------
 function commentOf(m) {
     if (!m) return '';
     if (m.message) return String(m.message);
@@ -149,9 +167,9 @@ function commentOf(m) {
 }
 
 function buildMessages(tx, display) {
-    const when = new Date(tx.utime * 1000).toLocaleString('fa-IR', {
-        timeZone: 'Asia/Tehran', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
-    });
+    const when = new Date(tx.utime * 1000).toLocaleString('en-GB', {
+        timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+    }) + ' UTC';
     let hashHex = '';
     try { hashHex = Buffer.from(tx.transaction_id.hash, 'base64').toString('hex'); } catch (e) { }
 
@@ -159,26 +177,24 @@ function buildMessages(tx, display) {
         '\n\n──────────────\n' +
         '👛 <code>' + esc(shortAddr(display)) + '</code>\n' +
         '🕒 ' + esc(when) +
-        (hashHex ? '\n🔗 <a href="https://tonviewer.com/transaction/' + hashHex + '">مشاهده تراکنش</a>' : '');
+        (hashHex ? '\n🔗 <a href="https://tonviewer.com/transaction/' + hashHex + '">View on Tonviewer</a>' : '');
 
     const result = [];
     const inMsg = tx.in_msg || {};
     const outs = (tx.out_msgs || []).filter(function (m) { return m.destination; });
 
     if (inMsg.source) {
-        // دریافت
         if (BigInt(inMsg.value || '0') > 0n) {
             const c = commentOf(inMsg);
             result.push(
-                '🟢 <b>دریافت TON</b>\n\n' +
+                '🟢 <b>Incoming TON</b>\n\n' +
                 '💰 <b>+' + formatTon(inMsg.value) + ' TON</b>\n' +
-                '👤 از:\n<code>' + esc(inMsg.source) + '</code>' +
+                '👤 From:\n<code>' + esc(inMsg.source) + '</code>' +
                 (c ? '\n💬 ' + esc(c.slice(0, 200)) : '') +
                 footer
             );
         }
     } else if (outs.length) {
-        // ارسال
         let total = 0n;
         outs.forEach(function (m) { total += BigInt(m.value || '0'); });
         const list = outs.slice(0, 4).map(function (m) {
@@ -188,17 +204,17 @@ function buildMessages(tx, display) {
                 (c ? '\n   💬 ' + esc(c.slice(0, 120)) : '');
         }).join('\n\n');
         result.push(
-            '🔴 <b>ارسال TON</b>\n\n' +
+            '🔴 <b>Outgoing TON</b>\n\n' +
             '💸 <b>−' + formatTon(total) + ' TON</b>\n\n' +
             list +
-            '\n\n⛽ کارمزد: ≈' + formatTon(tx.fee) + ' TON' +
+            '\n\n⛽ Fee: ≈' + formatTon(tx.fee) + ' TON' +
             footer
         );
     }
     return result;
 }
 
-// ---------- اشتراک ----------
+// ---------- subscribe / unsubscribe ----------
 async function subscribe(chatId, input) {
     const det = await ton('detectAddress', { address: input.trim() });
     if (det.test_only) throw new Error('TESTNET');
@@ -207,7 +223,6 @@ async function subscribe(chatId, input) {
     const display = det.non_bounceable.b64url;
 
     if (!state.addrs[key]) {
-        // فقط تراکنش‌های بعد از لحظه‌ی فعال‌سازی اعلان می‌شوند
         let lastLt = '0';
         try {
             const t = await ton('getTransactions', { address: raw, limit: 1 });
@@ -237,32 +252,62 @@ async function unsubscribe(chatId, input) {
     return count;
 }
 
-// ---------- دستورهای ربات ----------
+// ---------- commands & callbacks ----------
 const WELCOME =
-    'سلام 👋\n\n' +
-    'با این ربات می‌تونی اعلان لحظه‌ای دریافت و ارسال TON رو فعال کنی.\n\n' +
-    '📌 <b>نحوه استفاده:</b>\n' +
-    'آدرس ولتت رو بفرست (مثل <code>UQ...</code>)\n\n' +
-    '📋 <b>دستورات:</b>\n' +
-    '/list — مشاهده آدرس‌های فعال\n' +
-    '/stop — خاموش کردن همه اعلان‌ها\n' +
-    '/help — راهنما';
+    '👋 <b>Welcome to TON Wallet Notifier</b>\n\n' +
+    'Get instant alerts when TON is <b>received</b> or <b>sent</b> from your wallet.\n\n' +
+    '📌 <b>How to use</b>\n' +
+    'Just send your wallet address (e.g. <code>UQ...</code>)\n\n' +
+    '📋 <b>Commands</b>\n' +
+    '/list — Show active addresses\n' +
+    '/stop — Turn off all alerts\n' +
+    '/help — Show this message';
 
 async function doSubscribe(chatId, input) {
     try {
         const display = await subscribe(chatId, input);
         await send(chatId,
-            '✅ <b>اعلان فعال شد</b>\n\n' +
+            '✅ <b>Alerts activated!</b>\n\n' +
             '👛 <code>' + esc(display) + '</code>\n\n' +
-            'از این لحظه هر دریافت یا ارسال TON رو همین‌جا بهت خبر می‌دم.');
+            'You will now receive notifications for every incoming and outgoing TON transaction.',
+            { reply_markup: mainKeyboard() }
+        );
     } catch (e) {
         if (e.message === 'TESTNET') {
-            await send(chatId, '❌ آدرس تست‌نت پشتیبانی نمی‌شه.\nلطفاً آدرس <b>مین‌نت</b> بفرست.');
+            await send(chatId, '❌ Testnet addresses are not supported.\nPlease send a <b>mainnet</b> address.');
         } else {
             console.error('subscribe failed', e.message);
-            await send(chatId, '❌ آدرس معتبر نیست یا شبکه موقتاً مشکل داره.\nدوباره امتحان کن.');
+            await send(chatId, '❌ Invalid address or temporary network issue.\nPlease try again.');
         }
     }
+}
+
+async function showList(chatId) {
+    const mine = state.subs[chatId] ? Object.keys(state.subs[chatId]).map(function (k) { return state.subs[chatId][k]; }) : [];
+    if (!mine.length) {
+        return send(chatId, '📭 You have no active addresses yet.\n\nSend a wallet address to start receiving alerts.', { reply_markup: mainKeyboard() });
+    }
+    return send(chatId,
+        '📋 <b>My Active Addresses</b> (' + mine.length + ')\n\n' +
+        mine.map(function (a, i) { return (i + 1) + '. <code>' + esc(a) + '</code>'; }).join('\n\n'),
+        { reply_markup: mainKeyboard() }
+    );
+}
+
+async function handleCallback(cq) {
+    const chatId = cq.message.chat.id;
+    const data = cq.data || '';
+
+    if (data === 'my_addresses') {
+        await answerCallback(cq.id);
+        return showList(chatId);
+    }
+    if (data === 'stop_all') {
+        const n = await unsubscribe(chatId, null);
+        await answerCallback(cq.id, n ? 'Alerts stopped' : 'No active alerts');
+        return send(chatId, n ? '🔕 All alerts have been turned off.' : 'No active alerts found.', { reply_markup: mainKeyboard() });
+    }
+    return answerCallback(cq.id);
 }
 
 async function handleMessage(msg) {
@@ -277,37 +322,39 @@ async function handleMessage(msg) {
 
     if (cmd === '/start') {
         if (arg) return doSubscribe(chatId, arg);
-        return send(chatId, WELCOME);
+        return send(chatId, WELCOME, { reply_markup: mainKeyboard() });
     }
-    if (cmd === '/help') return send(chatId, WELCOME);
-    if (cmd === '/list') {
-        const mine = state.subs[chatId] ? Object.keys(state.subs[chatId]).map(function (k) { return state.subs[chatId][k]; }) : [];
-        if (!mine.length) return send(chatId, 'هنوز هیچ آدرسی فعال نکردی.\nآدرس ولتت رو بفرست تا اعلان‌ها روشن بشه.');
-        return send(chatId,
-            '📋 <b>آدرس‌های فعال</b> (' + mine.length + ')\n\n' +
-            mine.map(function (a, i) { return (i + 1) + '. <code>' + esc(a) + '</code>'; }).join('\n\n'));
-    }
+    if (cmd === '/help') return send(chatId, WELCOME, { reply_markup: mainKeyboard() });
+    if (cmd === '/list') return showList(chatId);
     if (cmd === '/stop') {
         try {
             const n = await unsubscribe(chatId, arg);
-            return send(chatId, n ? '🔕 اعلان‌ها خاموش شد.' : 'اعلان فعالی پیدا نشد.');
+            return send(chatId, n ? '🔕 All alerts have been turned off.' : 'No active alerts found.', { reply_markup: mainKeyboard() });
         } catch (e) {
-            return send(chatId, '❌ آدرس معتبر نیست.');
+            return send(chatId, '❌ Invalid address.');
         }
     }
     if (/^[A-Za-z0-9_\-+\/=:]{40,70}$/.test(text)) return doSubscribe(chatId, text);
-    return send(chatId, 'آدرس ولت TON رو بفرست یا /help رو بزن.');
+    return send(chatId, 'Please send a TON wallet address or use /help.', { reply_markup: mainKeyboard() });
 }
 
-// ---------- حلقه‌ها ----------
+// ---------- loops ----------
 async function updatesLoop() {
     let offset = 0;
     for (;;) {
         try {
-            const updates = await tg('getUpdates', { offset: offset, timeout: 50, allowed_updates: ['message'] });
+            const updates = await tg('getUpdates', {
+                offset: offset,
+                timeout: 50,
+                allowed_updates: ['message', 'callback_query']
+            });
             for (const u of updates) {
                 offset = u.update_id + 1;
-                if (u.message) handleMessage(u.message).catch(function (e) { console.error('handler error', e.message); });
+                if (u.message) {
+                    handleMessage(u.message).catch(function (e) { console.error('handler error', e.message); });
+                } else if (u.callback_query) {
+                    handleCallback(u.callback_query).catch(function (e) { console.error('callback error', e.message); });
+                }
             }
         } catch (e) {
             console.error('getUpdates error', e.message);
@@ -360,7 +407,6 @@ async function main() {
     if (!BOT_TOKEN) { console.error('BOT_TOKEN is not set'); process.exit(1); }
     await loadState();
 
-    // سرور کوچک برای هاست‌هایی که پورت باز می‌خواهند (و برای ping)
     http.createServer(function (req, res) { res.writeHead(200); res.end('ok'); }).listen(PORT);
 
     await tg('deleteWebhook', {}).catch(function () { });
