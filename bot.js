@@ -331,11 +331,19 @@ async function unsubscribe(chatId, keyOrNull) {
 
 // ---------- UI helpers ----------
 const WELCOME =
-    '👋 <b>Welcome to TON Wallet Notifier</b>\n\n' +
-    'Get instant alerts when TON is <b>received</b> or <b>sent</b>.\n\n' +
+    '👋 <b>TON Wallet Notifier</b>\n' +
+    '📦 Version <b>2.0</b>\n\n' +
+    'Get instant alerts when TON is <b>received</b> or <b>sent</b> from your wallet.\n\n' +
     '📌 <b>How to use</b>\n' +
     'Just send your wallet address (e.g. <code>UQ...</code>)\n\n' +
-    '✨ Features: Balance • USD value • Filters • Daily summary';
+    '✨ <b>Features</b>\n' +
+    '• 🔔 Real-time transaction alerts\n' +
+    '• 💰 Balance checker\n' +
+    '• 📈 Live TON price (Binance)\n' +
+    '• 💵 USD value display\n' +
+    '• ⚙️ Min amount & direction filters\n' +
+    '• 📊 Daily summary\n' +
+    '• 🗑 Easy address management';
 
 async function doSubscribe(chatId, input) {
     try {
@@ -477,7 +485,6 @@ async function handleMessage(msg) {
     const text = (msg.text || '').trim();
     if (!text) return;
 
-    // Check if user is setting min amount
     if (/^\d+(\.\d+)?$/.test(text)) {
         const val = parseFloat(text);
         if (val >= 0 && val < 1000000) {
