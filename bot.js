@@ -30,9 +30,9 @@ function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
 function esc(s) {
     return String(s === undefined || s === null ? '' : s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+        .replace(/&/g, '&')
+        .replace(/</g, '<')
+        .replace(/>/g, '>');
 }
 
 function shortAddr(a) {
@@ -155,39 +155,43 @@ function buildMessages(tx, display) {
     let hashHex = '';
     try { hashHex = Buffer.from(tx.transaction_id.hash, 'base64').toString('hex'); } catch (e) { }
 
-    const footer = '\n\n👛 ولت: <code>' + esc(shortAddr(display)) + '</code>\n🕒 ' + esc(when) +
-        (hashHex ? '\n🔎 <a href="https://tonviewer.com/transaction/' + hashHex + '">مشاهده در Tonviewer</a>' : '');
+    const footer =
+        '\n\n──────────────\n' +
+        '👛 <code>' + esc(shortAddr(display)) + '</code>\n' +
+        '🕒 ' + esc(when) +
+        (hashHex ? '\n🔗 <a href="https://tonviewer.com/transaction/' + hashHex + '">مشاهده تراکنش</a>' : '');
 
     const result = [];
     const inMsg = tx.in_msg || {};
     const outs = (tx.out_msgs || []).filter(function (m) { return m.destination; });
 
     if (inMsg.source) {
-        // پیام داخلی ورودی = دریافت
+        // دریافت
         if (BigInt(inMsg.value || '0') > 0n) {
             const c = commentOf(inMsg);
             result.push(
-                '📥 <b>دریافت TON</b>\n\n' +
-                '💰 مقدار: <b>+' + formatTon(inMsg.value) + ' TON</b>\n' +
+                '🟢 <b>دریافت TON</b>\n\n' +
+                '💰 <b>+' + formatTon(inMsg.value) + ' TON</b>\n' +
                 '👤 از:\n<code>' + esc(inMsg.source) + '</code>' +
-                (c ? '\n💬 Comment: ' + esc(c.slice(0, 200)) : '') +
+                (c ? '\n💬 ' + esc(c.slice(0, 200)) : '') +
                 footer
             );
         }
     } else if (outs.length) {
-        // پیام خارجی ورودی که پیام‌های داخلی خروجی ساخته = ارسال از ولت
+        // ارسال
         let total = 0n;
         outs.forEach(function (m) { total += BigInt(m.value || '0'); });
         const list = outs.slice(0, 4).map(function (m) {
             const c = commentOf(m);
-            return '🎯 به' + (outs.length > 1 ? ' (' + formatTon(m.value) + ' TON)' : '') + ':\n<code>' + esc(m.destination) + '</code>' +
-                (c ? '\n💬 Comment: ' + esc(c.slice(0, 200)) : '');
+            return '🎯 <code>' + esc(m.destination) + '</code>' +
+                (outs.length > 1 ? '  •  ' + formatTon(m.value) + ' TON' : '') +
+                (c ? '\n   💬 ' + esc(c.slice(0, 120)) : '');
         }).join('\n\n');
         result.push(
-            '📤 <b>ارسال TON</b>\n\n' +
-            '💸 مقدار: <b>−' + formatTon(total) + ' TON</b>\n' +
+            '🔴 <b>ارسال TON</b>\n\n' +
+            '💸 <b>−' + formatTon(total) + ' TON</b>\n\n' +
             list +
-            '\n⛽ کارمزد: ≈' + formatTon(tx.fee) + ' TON' +
+            '\n\n⛽ کارمزد: ≈' + formatTon(tx.fee) + ' TON' +
             footer
         );
     }
@@ -235,24 +239,28 @@ async function unsubscribe(chatId, input) {
 
 // ---------- دستورهای ربات ----------
 const WELCOME =
-    'سلام 👋\n' +
-    'وقتی TON به ولتت برسه یا از ولتت ارسال بشه، همین‌جا بهت پیام می‌دم.\n\n' +
-    'آدرس ولتت رو (شبیه <code>UQ...</code>) همین‌جا بفرست تا اعلان‌ها فعال بشه.\n\n' +
-    '/list — آدرس‌های فعال\n' +
-    '/stop — خاموش کردن همه‌ی اعلان‌ها';
+    'سلام 👋\n\n' +
+    'با این ربات می‌تونی اعلان لحظه‌ای دریافت و ارسال TON رو فعال کنی.\n\n' +
+    '📌 <b>نحوه استفاده:</b>\n' +
+    'آدرس ولتت رو بفرست (مثل <code>UQ...</code>)\n\n' +
+    '📋 <b>دستورات:</b>\n' +
+    '/list — مشاهده آدرس‌های فعال\n' +
+    '/stop — خاموش کردن همه اعلان‌ها\n' +
+    '/help — راهنما';
 
 async function doSubscribe(chatId, input) {
     try {
         const display = await subscribe(chatId, input);
         await send(chatId,
-            '✅ اعلان‌ها فعال شد.\n\n👛 <code>' + esc(display) + '</code>\n\n' +
-            'از این به بعد هر دریافت یا ارسال TON رو همین‌جا خبر می‌دم.');
+            '✅ <b>اعلان فعال شد</b>\n\n' +
+            '👛 <code>' + esc(display) + '</code>\n\n' +
+            'از این لحظه هر دریافت یا ارسال TON رو همین‌جا بهت خبر می‌دم.');
     } catch (e) {
         if (e.message === 'TESTNET') {
-            await send(chatId, '❌ آدرس testnet پشتیبانی نمی‌شه. آدرس mainnet بفرست.');
+            await send(chatId, '❌ آدرس تست‌نت پشتیبانی نمی‌شه.\nلطفاً آدرس <b>مین‌نت</b> بفرست.');
         } else {
             console.error('subscribe failed', e.message);
-            await send(chatId, '❌ آدرس معتبر نیست یا الان شبکه مشکل داره. آدرس رو دوباره بفرست.');
+            await send(chatId, '❌ آدرس معتبر نیست یا شبکه موقتاً مشکل داره.\nدوباره امتحان کن.');
         }
     }
 }
@@ -274,8 +282,10 @@ async function handleMessage(msg) {
     if (cmd === '/help') return send(chatId, WELCOME);
     if (cmd === '/list') {
         const mine = state.subs[chatId] ? Object.keys(state.subs[chatId]).map(function (k) { return state.subs[chatId][k]; }) : [];
-        if (!mine.length) return send(chatId, 'هنوز آدرسی فعال نکردی. آدرس ولتت رو بفرست.');
-        return send(chatId, '👛 آدرس‌های فعال:\n\n' + mine.map(function (a) { return '<code>' + esc(a) + '</code>'; }).join('\n\n'));
+        if (!mine.length) return send(chatId, 'هنوز هیچ آدرسی فعال نکردی.\nآدرس ولتت رو بفرست تا اعلان‌ها روشن بشه.');
+        return send(chatId,
+            '📋 <b>آدرس‌های فعال</b> (' + mine.length + ')\n\n' +
+            mine.map(function (a, i) { return (i + 1) + '. <code>' + esc(a) + '</code>'; }).join('\n\n'));
     }
     if (cmd === '/stop') {
         try {
