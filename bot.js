@@ -164,22 +164,31 @@ function formatToman(n) {
     return v.toLocaleString('en-US');
 }
 
-async function showTonPrice(chatId) {
+async function showTonPrice(chatId, amount) {
     await fetchTonPrice();
     await fetchUsdToman();
     if (!tonPriceUsd) {
         return send(chatId, '❌ Could not fetch TON price right now. Try again.', { reply_markup: mainKeyboard() });
     }
+    const amt = (amount && amount > 0) ? amount : 1;
+    const usd = tonPriceUsd * amt;
     let text = '💎 <b>TON Price</b>\n\n';
-    text += '💵 <b>$' + tonPriceUsd.toFixed(4) + '</b> USD\n';
+    text += '📌 Unit: <b>$' + tonPriceUsd.toFixed(4) + '</b> / TON\n';
     if (usdToman > 0) {
-        const toman = tonPriceUsd * usdToman;
-        text += '🇮🇷 <b>' + formatToman(toman) + '</b> تومان\n';
-        text += '\n📎 USDT ≈ <b>' + formatToman(usdToman) + '</b> تومان';
-    } else {
-        text += '🇮🇷 Toman rate unavailable temporarily';
+        text += '📎 USDT ≈ <b>' + formatToman(usdToman) + '</b> تومان\n';
     }
-    text += '\n\n📡 Source: Binance TON/USDT';
+    text += '\n──────────────\n';
+    text += '🔢 Amount: <b>' + amt + ' TON</b>\n';
+    text += '💵 <b>$' + usd.toFixed(4) + '</b> USD\n';
+    if (usdToman > 0) {
+        text += '🇮🇷 <b>' + formatToman(usd * usdToman) + '</b> تومان\n';
+    } else {
+        text += '🇮🇷 Toman rate unavailable temporarily\n';
+    }
+    text += '\n📡 Source: Binance TON/USDT';
+    if (amt === 1 && !(amount && amount > 0)) {
+        text += '\n\n💡 Tip: send <code>1.5 تون</code> to convert any amount';
+    }
     return send(chatId, text, { reply_markup: mainKeyboard() });
 }
 
@@ -334,7 +343,7 @@ const WELCOME =
     '👋 <b>TON Wallet Notifier</b>\n📦 Version <b>2.1</b>\n\n' +
     'Get instant alerts when TON is <b>received</b> or <b>sent</b> from your wallet.\n\n' +
     '📌 <b>How to use</b>\nJust send your wallet address (e.g. <code>UQ...</code>)\n\n' +
-    '✨ <b>Features</b>\n• 🔔 Real-time transaction alerts\n• 💰 Balance checker\n• 📈 Live TON price (USD + Toman) — send: تون\n' +
+    '✨ <b>Features</b>\n• 🔔 Real-time transaction alerts\n• 💰 Balance checker\n• 📈 Live TON price (USD + Toman) — send: تون or 1.5 تون\n' +
     '• 💵 USD value display\n• 📤 Total withdrawn calculator\n• ⚙️ Min amount & direction filters\n• 📊 Daily summary\n• 🗑 Easy address management';
 
 async function doSubscribe(chatId, input) {
@@ -450,7 +459,18 @@ async function handleMessage(msg) {
     const chatId = msg.chat.id;
     const text = (msg.text || '').trim();
     if (!text) return;
-    const low = text.toLowerCase();
+    const low = text.toLowerCase().trim();
+    // e.g. "1 تون", "1.5 ton", "2تون", "تون 3"
+    let amtParsed = null;
+    let m1 = text.trim().match(/^(\d+(?:\.\d+)?)\s*(?:تون|ton)$/i);
+    if (m1) amtParsed = parseFloat(m1[1]);
+    else {
+        let m2 = text.trim().match(/^(?:تون|ton)\s*(\d+(?:\.\d+)?)$/i);
+        if (m2) amtParsed = parseFloat(m2[1]);
+    }
+    if (amtParsed !== null && amtParsed > 0 && amtParsed < 1e12) {
+        return showTonPrice(chatId, amtParsed);
+    }
     if (low === 'تون' || low === 'ton' || low === 'قیمت تون' || low === 'قیمت' || low === '/ton' || low === '/price') {
         return showTonPrice(chatId);
     }
