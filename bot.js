@@ -175,9 +175,15 @@ function answerCallback(id, text) {
     return tg('answerCallbackQuery', { callback_query_id: id, text: text || '' }).catch(() => {});
 }
 
-async function notify(chatId, text) {
-    try { await send(chatId, text); }
-    catch (e) {
+async function notify(chatId, text, buttonUrl) {
+    try {
+        const extra = buttonUrl ? {
+            reply_markup: {
+                inline_keyboard: [[{ text: 'Open transaction', url: buttonUrl }]]
+            }
+        } : undefined;
+        await send(chatId, text, extra);
+    } catch (e) {
         if (e.code === 403) { delete state.subs[chatId]; delete state.settings[chatId]; dirty = true; }
         else console.error('notify failed', chatId, e.message);
     }
@@ -197,7 +203,7 @@ function buildMessages(tx, display, chatId) {
     const s = getSettings(chatId);
     let hashHex = '';
     try { hashHex = Buffer.from(tx.transaction_id.hash, 'base64').toString('hex'); } catch (e) {}
-    const txLink = hashHex ? '\n\n<a href="https://tonviewer.com/transaction/' + hashHex + '">Open transaction</a>' : '';
+    const txUrl = hashHex ? 'https://tonviewer.com/transaction/' + hashHex : null;
 
     const result = [];
     const inMsg = tx.in_msg || {};
@@ -207,13 +213,12 @@ function buildMessages(tx, display, chatId) {
         const val = nanoToNumber(inMsg.value);
         if (val > 0 && val >= s.minTon) {
             const c = commentOf(inMsg);
-            let msg = '🟢 <b>Received TON</b>\n';
+            let msg = '🍕 <b>Received TON</b>\n';
             msg += 'Amount: <b>' + formatTon(inMsg.value) + ' TON</b>';
             if (tonPriceUsd > 0) msg += ' (' + (val * tonPriceUsd).toFixed(2) + ' USD)';
             msg += '\nFrom: <code>' + esc(shortAddr(inMsg.source)) + '</code>';
             if (c) msg += '\nComment: ' + esc(c.slice(0, 120));
-            msg += txLink;
-            result.push(msg);
+            result.push({ text: msg, url: txUrl });
             s.dayIn += val;
         }
     } else if (outs.length && !s.onlyIn) {
@@ -222,15 +227,14 @@ function buildMessages(tx, display, chatId) {
         const val = nanoToNumber(total);
         if (val >= s.minTon) {
             const dest = outs[0] ? shortAddr(outs[0].destination) : '—';
-            let msg = '🔴 <b>Sent TON</b>\n';
+            let msg = '🚀 <b>Sent TON</b>\n';
             msg += 'Amount: <b>' + formatTon(total) + ' TON</b>';
             if (tonPriceUsd > 0) msg += ' (' + (val * tonPriceUsd).toFixed(2) + ' USD)';
             msg += '\nTo: <code>' + esc(dest) + '</code>';
             if (outs.length > 1) msg += ' (+' + (outs.length - 1) + ' more)';
             const c = commentOf(outs[0]);
             if (c) msg += '\nComment: ' + esc(c.slice(0, 120));
-            msg += txLink;
-            result.push(msg);
+            result.push({ text: msg, url: txUrl });
             s.dayOut += val;
         }
     }
@@ -456,7 +460,7 @@ async function pollOnce() {
                 for (const chatId of chats) {
                     if (!state.subs[chatId]) continue;
                     const msgs = buildMessages(tx, state.subs[chatId][key], chatId);
-                    for (const m of msgs) await notify(chatId, m);
+                    for (const m of msgs) await notify(chatId, m.text, m.url);
                 }
                 a.lastLt = tx.transaction_id.lt; dirty = true;
             }
