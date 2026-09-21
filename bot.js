@@ -17,7 +17,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const TONCENTER_API_KEY = process.env.TONCENTER_API_KEY || '';
 const FIREBASE_DB_URL = (process.env.FIREBASE_DB_URL || '').replace(/\/+$/, '');
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
-const POLL_MS = Number(process.env.POLL_MS || 2000);
+const POLL_MS = Number(process.env.POLL_MS || 1000);
 const PORT = Number(process.env.PORT || 3000);
 const DATA_FILE = process.env.DATA_FILE || './data.json';
 const TONCENTER = 'https://toncenter.com/api/v2';
@@ -52,6 +52,8 @@ let dirty = false;
 let saving = Promise.resolve();
 let tonPriceUsd = 0;
 let lastPriceFetch = 0;
+let usdToman = 0;
+let lastTomanFetch = 0;
 
 function getSettings(chatId) {
     if (!state.settings[chatId]) {
@@ -106,7 +108,7 @@ async function ton(method, params) {
 }
 
 async function fetchTonPrice() {
-    if (Date.now() - lastPriceFetch < 60 * 1000 && tonPriceUsd > 0) return tonPriceUsd;
+    if (Date.now() - lastPriceFetch < 30 * 1000 && tonPriceUsd > 0) return tonPriceUsd;
     try {
         const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT');
         if (r.ok) {
@@ -124,6 +126,61 @@ async function fetchTonPrice() {
         }
     } catch (e) { console.error('CoinGecko price failed', e.message); }
     return tonPriceUsd;
+}
+
+async function fetchUsdToman() {
+    if (Date.now() - lastTomanFetch < 5 * 60 * 1000 && usdToman > 0) return usdToman;
+    const endpoints = [
+        async () => {
+            const r = await fetch('https://api.tetherland.com/currencies');
+            if (!r.ok) throw new Error('tetherland ' + r.status);
+            const j = await r.json();
+            const p = parseFloat(j?.data?.currencies?.USDT?.price || j?.data?.USDT?.price || 0);
+            if (p > 1000) return p;
+            throw new Error('tetherland bad');
+        },
+        async () => {
+            const r = await fetch('https://api.wallex.ir/v1/currencies/stats');
+            if (!r.ok) throw new Error('wallex ' + r.status);
+            const j = await r.json();
+            const list = j?.result?.symbols || j?.result || [];
+            const usdt = (Array.isArray(list) ? list : []).find(x => (x.symbol || x.key || '') === 'USDTTMN' || (x.symbol || '') === 'USDT');
+            const p = parseFloat(usdt?.stats?.lastPrice || usdt?.lastPrice || usdt?.price || 0);
+            if (p > 1000) return p;
+            throw new Error('wallex bad');
+        }
+    ];
+    for (const fn of endpoints) {
+        try {
+            const p = await fn();
+            if (p > 0) { usdToman = p; lastTomanFetch = Date.now(); return usdToman; }
+        } catch (e) { console.error('toman rate failed', e.message); }
+    }
+    return usdToman;
+}
+
+function formatToman(n) {
+    const v = Math.round(Number(n) || 0);
+    return v.toLocaleString('en-US');
+}
+
+async function showTonPrice(chatId) {
+    await fetchTonPrice();
+    await fetchUsdToman();
+    if (!tonPriceUsd) {
+        return send(chatId, '❌ Could not fetch TON price right now. Try again.', { reply_markup: mainKeyboard() });
+    }
+    let text = '💎 <b>TON Price</b>\n\n';
+    text += '💵 <b>$' + tonPriceUsd.toFixed(4) + '</b> USD\n';
+    if (usdToman > 0) {
+        const toman = tonPriceUsd * usdToman;
+        text += '🇮🇷 <b>' + formatToman(toman) + '</b> تومان\n';
+        text += '\n📎 USDT ≈ <b>' + formatToman(usdToman) + '</b> تومان';
+    } else {
+        text += '🇮🇷 Toman rate unavailable temporarily';
+    }
+    text += '\n\n📡 Source: Binance TON/USDT';
+    return send(chatId, text, { reply_markup: mainKeyboard() });
 }
 
 function usdStr(tonAmount) {
@@ -145,8 +202,8 @@ function mainKeyboard() {
     return {
         inline_keyboard: [
             [ { text: '📋 My Addresses', callback_data: 'my_addresses' }, { text: '💰 Balances', callback_data: 'balances' } ],
-            [ { text: '📤 Total Withdrawn', callback_data: 'total_out' }, { text: '⚙️ Settings', callback_data: 'settings' } ],
-            [ { text: '🔕 Stop All', callback_data: 'stop_all' } ]
+            [ { text: '💎 TON Price', callback_data: 'ton_price' }, { text: '📤 Total Withdrawn', callback_data: 'total_out' } ],
+            [ { text: '⚙️ Settings', callback_data: 'settings' }, { text: '🔕 Stop All', callback_data: 'stop_all' } ]
         ]
     };
 }
@@ -277,7 +334,7 @@ const WELCOME =
     '👋 <b>TON Wallet Notifier</b>\n📦 Version <b>2.1</b>\n\n' +
     'Get instant alerts when TON is <b>received</b> or <b>sent</b> from your wallet.\n\n' +
     '📌 <b>How to use</b>\nJust send your wallet address (e.g. <code>UQ...</code>)\n\n' +
-    '✨ <b>Features</b>\n• 🔔 Real-time transaction alerts\n• 💰 Balance checker\n• 📈 Live TON price (Binance)\n' +
+    '✨ <b>Features</b>\n• 🔔 Real-time transaction alerts\n• 💰 Balance checker\n• 📈 Live TON price (USD + Toman) — send: تون\n' +
     '• 💵 USD value display\n• 📤 Total withdrawn calculator\n• ⚙️ Min amount & direction filters\n• 📊 Daily summary\n• 🗑 Easy address management';
 
 async function doSubscribe(chatId, input) {
@@ -359,6 +416,7 @@ async function handleCallback(cq) {
     const data = cq.data || '';
     if (data === 'my_addresses') { await answerCallback(cq.id); return showList(chatId); }
     if (data === 'balances') { await answerCallback(cq.id, 'Fetching...'); return showBalances(chatId); }
+    if (data === 'ton_price') { await answerCallback(cq.id, 'Fetching...'); return showTonPrice(chatId); }
     if (data === 'total_out') { await answerCallback(cq.id, 'Calculating...'); return showTotalWithdrawn(chatId); }
     if (data === 'settings') { await answerCallback(cq.id); return showSettings(chatId); }
     if (data === 'stop_all') {
@@ -392,6 +450,10 @@ async function handleMessage(msg) {
     const chatId = msg.chat.id;
     const text = (msg.text || '').trim();
     if (!text) return;
+    const low = text.toLowerCase();
+    if (low === 'تون' || low === 'ton' || low === 'قیمت تون' || low === 'قیمت' || low === '/ton' || low === '/price') {
+        return showTonPrice(chatId);
+    }
     if (/^\d+(\.\d+)?$/.test(text)) {
         const val = parseFloat(text);
         if (val >= 0 && val < 1000000) {
@@ -465,7 +527,7 @@ async function pollOnce() {
                 a.lastLt = tx.transaction_id.lt; dirty = true;
             }
         } catch (e) { console.error('poll error', key, e.message); }
-        await sleep(TONCENTER_API_KEY ? 200 : 1200);
+        await sleep(TONCENTER_API_KEY ? 150 : 1000);
     }
     if (dirty) { dirty = false; await saveState(); }
 }
@@ -478,7 +540,7 @@ async function pollLoop() {
             await pollOnce();
             if (Date.now() - lastDailyCheck > 30 * 60 * 1000) { await checkDailySummaries(); lastDailyCheck = Date.now(); }
         } catch (e) { console.error('pollOnce error', e.message); }
-        await sleep(Math.max(1000, POLL_MS - (Date.now() - t0)));
+        await sleep(Math.max(500, POLL_MS - (Date.now() - t0)));
     }
 }
 
