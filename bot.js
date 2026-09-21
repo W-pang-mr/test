@@ -195,14 +195,9 @@ function commentOf(m) {
 
 function buildMessages(tx, display, chatId) {
     const s = getSettings(chatId);
-    const when = new Date(tx.utime * 1000).toLocaleString('en-GB', {
-        timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
-    }) + ' UTC';
     let hashHex = '';
     try { hashHex = Buffer.from(tx.transaction_id.hash, 'base64').toString('hex'); } catch (e) {}
-
-    const footer = '\n\n──────────────\n👛 <code>' + esc(shortAddr(display)) + '</code>\n🕒 ' + esc(when) +
-        (hashHex ? '\n🔗 <a href="https://tonviewer.com/transaction/' + hashHex + '">View on Tonviewer</a>' : '');
+    const txLink = hashHex ? '\n\n<a href="https://tonviewer.com/transaction/' + hashHex + '">Open transaction</a>' : '';
 
     const result = [];
     const inMsg = tx.in_msg || {};
@@ -212,8 +207,13 @@ function buildMessages(tx, display, chatId) {
         const val = nanoToNumber(inMsg.value);
         if (val > 0 && val >= s.minTon) {
             const c = commentOf(inMsg);
-            result.push('🟢 <b>Incoming TON</b>\n\n💰 <b>+' + formatTon(inMsg.value) + ' TON</b>' + usdStr(val) +
-                '\n👤 From:\n<code>' + esc(inMsg.source) + '</code>' + (c ? '\n💬 ' + esc(c.slice(0, 200)) : '') + footer);
+            let msg = '🟢 <b>Received TON</b>\n';
+            msg += 'Amount: <b>' + formatTon(inMsg.value) + ' TON</b>';
+            if (tonPriceUsd > 0) msg += ' (' + (val * tonPriceUsd).toFixed(2) + ' USD)';
+            msg += '\nFrom: <code>' + esc(shortAddr(inMsg.source)) + '</code>';
+            if (c) msg += '\nComment: ' + esc(c.slice(0, 120));
+            msg += txLink;
+            result.push(msg);
             s.dayIn += val;
         }
     } else if (outs.length && !s.onlyIn) {
@@ -221,13 +221,16 @@ function buildMessages(tx, display, chatId) {
         outs.forEach(m => { total += BigInt(m.value || '0'); });
         const val = nanoToNumber(total);
         if (val >= s.minTon) {
-            const list = outs.slice(0, 4).map(m => {
-                const c = commentOf(m);
-                return '🎯 <code>' + esc(m.destination) + '</code>' + (outs.length > 1 ? '  •  ' + formatTon(m.value) + ' TON' : '') +
-                    (c ? '\n   💬 ' + esc(c.slice(0, 120)) : '');
-            }).join('\n\n');
-            result.push('🔴 <b>Outgoing TON</b>\n\n💸 <b>−' + formatTon(total) + ' TON</b>' + usdStr(val) + '\n\n' + list +
-                '\n\n⛽ Fee: ≈' + formatTon(tx.fee) + ' TON' + footer);
+            const dest = outs[0] ? shortAddr(outs[0].destination) : '—';
+            let msg = '🔴 <b>Sent TON</b>\n';
+            msg += 'Amount: <b>' + formatTon(total) + ' TON</b>';
+            if (tonPriceUsd > 0) msg += ' (' + (val * tonPriceUsd).toFixed(2) + ' USD)';
+            msg += '\nTo: <code>' + esc(dest) + '</code>';
+            if (outs.length > 1) msg += ' (+' + (outs.length - 1) + ' more)';
+            const c = commentOf(outs[0]);
+            if (c) msg += '\nComment: ' + esc(c.slice(0, 120));
+            msg += txLink;
+            result.push(msg);
             s.dayOut += val;
         }
     }
