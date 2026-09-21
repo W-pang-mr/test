@@ -213,7 +213,7 @@ function buildMessages(tx, display, chatId) {
         const val = nanoToNumber(inMsg.value);
         if (val > 0 && val >= s.minTon) {
             const c = commentOf(inMsg);
-            let msg = '🍕 <b>Received TON</b>\n';
+            let msg = '🎉 <b>Received TON</b>\n';
             msg += 'Amount: <b>' + formatTon(inMsg.value) + ' TON</b>';
             if (tonPriceUsd > 0) msg += ' (' + (val * tonPriceUsd).toFixed(2) + ' USD)';
             msg += '\nFrom: <code>' + esc(shortAddr(inMsg.source)) + '</code>';
