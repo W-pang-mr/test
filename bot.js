@@ -1,12 +1,10 @@
 'use strict';
 /*
- * TON Wallet Notifier Bot v2.1
+ * TON Wallet Notifier Bot v2.2
+ * - Faster polling (parallel + lower interval)
+ * - Any number → TON price (USD + Toman), accurate & quick
  * - Instant alerts for incoming / outgoing TON
- * - Balance check + Live Binance price
- * - Total Withdrawn calculator
- * - Per-address remove buttons
- * - Min amount & direction filters
- * - Daily summary
+ * - Balance, Total Withdrawn, filters, daily summary
  * Zero dependencies (Node 18+)
  */
 
@@ -17,18 +15,21 @@ const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const TONCENTER_API_KEY = process.env.TONCENTER_API_KEY || '';
 const FIREBASE_DB_URL = (process.env.FIREBASE_DB_URL || '').replace(/\/+$/, '');
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
-const POLL_MS = Number(process.env.POLL_MS || 1000);
+// Default 500ms — with API key can go lower (e.g. POLL_MS=300)
+const POLL_MS = Number(process.env.POLL_MS || 500);
 const PORT = Number(process.env.PORT || 3000);
 const DATA_FILE = process.env.DATA_FILE || './data.json';
 const TONCENTER = 'https://toncenter.com/api/v2';
+// How many addresses to poll at the same time
+const POLL_CONCURRENCY = Number(process.env.POLL_CONCURRENCY || (TONCENTER_API_KEY ? 4 : 2));
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function esc(s) {
     return String(s ?? '')
-        .replace(/&/g, '&')
-        .replace(/</g, '<')
-        .replace(/>/g, '>');
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 }
 
 function shortAddr(a) {
@@ -54,6 +55,8 @@ let tonPriceUsd = 0;
 let lastPriceFetch = 0;
 let usdToman = 0;
 let lastTomanFetch = 0;
+// pending "set min amount" chats
+const awaitingMin = new Set();
 
 function getSettings(chatId) {
     if (!state.settings[chatId]) {
@@ -99,7 +102,7 @@ async function ton(method, params) {
     const headers = TONCENTER_API_KEY ? { 'X-API-Key': TONCENTER_API_KEY } : {};
     for (let attempt = 0; attempt < 3; attempt++) {
         const r = await fetch(url, { headers });
-        if (r.status === 429) { await sleep(1500 * (attempt + 1)); continue; }
+        if (r.status === 429) { await sleep(800 * (attempt + 1)); continue; }
         const j = await r.json().catch(() => null);
         if (!j || !j.ok) throw new Error((j && j.error) || ('toncenter ' + r.status));
         return j.result;
@@ -107,32 +110,45 @@ async function ton(method, params) {
     throw new Error('toncenter rate limited');
 }
 
-async function fetchTonPrice() {
-    if (Date.now() - lastPriceFetch < 30 * 1000 && tonPriceUsd > 0) return tonPriceUsd;
+async function fetchTonPrice(force) {
+    if (!force && Date.now() - lastPriceFetch < 15 * 1000 && tonPriceUsd > 0) return tonPriceUsd;
+    // Binance first (most accurate live spot)
     try {
-        const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT');
+        const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT', {
+            signal: AbortSignal.timeout(4000)
+        });
         if (r.ok) {
             const j = await r.json();
             const p = parseFloat(j.price);
-            if (p > 0) { tonPriceUsd = p; lastPriceFetch = Date.now(); return tonPriceUsd; }
+            if (p > 0) {
+                tonPriceUsd = p;
+                lastPriceFetch = Date.now();
+                return tonPriceUsd;
+            }
         }
     } catch (e) { console.error('Binance price failed', e.message); }
+    // Fallback CoinGecko
     try {
-        const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd');
+        const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd', {
+            signal: AbortSignal.timeout(5000)
+        });
         if (r.ok) {
             const j = await r.json();
             const p = j['the-open-network']?.usd || 0;
-            if (p > 0) { tonPriceUsd = p; lastPriceFetch = Date.now(); }
+            if (p > 0) {
+                tonPriceUsd = p;
+                lastPriceFetch = Date.now();
+            }
         }
     } catch (e) { console.error('CoinGecko price failed', e.message); }
     return tonPriceUsd;
 }
 
-async function fetchUsdToman() {
-    if (Date.now() - lastTomanFetch < 5 * 60 * 1000 && usdToman > 0) return usdToman;
+async function fetchUsdToman(force) {
+    if (!force && Date.now() - lastTomanFetch < 3 * 60 * 1000 && usdToman > 0) return usdToman;
     const endpoints = [
         async () => {
-            const r = await fetch('https://api.tetherland.com/currencies');
+            const r = await fetch('https://api.tetherland.com/currencies', { signal: AbortSignal.timeout(5000) });
             if (!r.ok) throw new Error('tetherland ' + r.status);
             const j = await r.json();
             const p = parseFloat(j?.data?.currencies?.USDT?.price || j?.data?.USDT?.price || 0);
@@ -140,11 +156,13 @@ async function fetchUsdToman() {
             throw new Error('tetherland bad');
         },
         async () => {
-            const r = await fetch('https://api.wallex.ir/v1/currencies/stats');
+            const r = await fetch('https://api.wallex.ir/v1/currencies/stats', { signal: AbortSignal.timeout(5000) });
             if (!r.ok) throw new Error('wallex ' + r.status);
             const j = await r.json();
             const list = j?.result?.symbols || j?.result || [];
-            const usdt = (Array.isArray(list) ? list : []).find(x => (x.symbol || x.key || '') === 'USDTTMN' || (x.symbol || '') === 'USDT');
+            const usdt = (Array.isArray(list) ? list : []).find(x =>
+                (x.symbol || x.key || '') === 'USDTTMN' || (x.symbol || '') === 'USDT'
+            );
             const p = parseFloat(usdt?.stats?.lastPrice || usdt?.lastPrice || usdt?.price || 0);
             if (p > 1000) return p;
             throw new Error('wallex bad');
@@ -153,7 +171,11 @@ async function fetchUsdToman() {
     for (const fn of endpoints) {
         try {
             const p = await fn();
-            if (p > 0) { usdToman = p; lastTomanFetch = Date.now(); return usdToman; }
+            if (p > 0) {
+                usdToman = p;
+                lastTomanFetch = Date.now();
+                return usdToman;
+            }
         } catch (e) { console.error('toman rate failed', e.message); }
     }
     return usdToman;
@@ -165,8 +187,8 @@ function formatToman(n) {
 }
 
 async function showTonPrice(chatId, amount) {
-    await fetchTonPrice();
-    await fetchUsdToman();
+    // parallel price + toman for speed
+    await Promise.all([fetchTonPrice(true), fetchUsdToman()]);
     if (!tonPriceUsd) {
         return send(chatId, '❌ Could not fetch TON price right now. Try again.', { reply_markup: mainKeyboard() });
     }
@@ -186,8 +208,8 @@ async function showTonPrice(chatId, amount) {
         text += '🇮🇷 Toman rate unavailable temporarily\n';
     }
     text += '\n📡 Source: Binance TON/USDT';
-    if (amt === 1 && !(amount && amount > 0)) {
-        text += '\n\n💡 Tip: send <code>1.5 تون</code> to convert any amount';
+    if (!(amount && amount > 0)) {
+        text += '\n\n💡 Send any number (e.g. <code>2.5</code> or <code>1.5 تون</code>) to convert';
     }
     return send(chatId, text, { reply_markup: mainKeyboard() });
 }
@@ -200,19 +222,34 @@ function usdStr(tonAmount) {
 
 async function tg(method, params) {
     const r = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/' + method, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(params || {})
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(params || {})
     });
     const j = await r.json();
-    if (!j.ok) { const err = new Error(j.description || 'telegram error'); err.code = j.error_code; throw err; }
+    if (!j.ok) {
+        const err = new Error(j.description || 'telegram error');
+        err.code = j.error_code;
+        throw err;
+    }
     return j.result;
 }
 
 function mainKeyboard() {
     return {
         inline_keyboard: [
-            [ { text: '📋 My Addresses', callback_data: 'my_addresses' }, { text: '💰 Balances', callback_data: 'balances' } ],
-            [ { text: '💎 TON Price', callback_data: 'ton_price' }, { text: '📤 Total Withdrawn', callback_data: 'total_out' } ],
-            [ { text: '⚙️ Settings', callback_data: 'settings' }, { text: '🔕 Stop All', callback_data: 'stop_all' } ]
+            [
+                { text: '📋 My Addresses', callback_data: 'my_addresses' },
+                { text: '💰 Balances', callback_data: 'balances' }
+            ],
+            [
+                { text: '💎 TON Price', callback_data: 'ton_price' },
+                { text: '📤 Total Withdrawn', callback_data: 'total_out' }
+            ],
+            [
+                { text: '⚙️ Settings', callback_data: 'settings' },
+                { text: '🔕 Stop All', callback_data: 'stop_all' }
+            ]
         ]
     };
 }
@@ -232,7 +269,12 @@ function settingsKeyboard(chatId) {
 }
 
 function send(chatId, text, extra) {
-    const payload = { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true };
+    const payload = {
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true
+    };
     if (extra?.reply_markup) payload.reply_markup = extra.reply_markup;
     return tg('sendMessage', payload);
 }
@@ -243,15 +285,16 @@ function answerCallback(id, text) {
 
 async function notify(chatId, text, buttonUrl) {
     try {
-        const extra = buttonUrl ? {
-            reply_markup: {
-                inline_keyboard: [[{ text: 'Open transaction', url: buttonUrl }]]
-            }
-        } : undefined;
+        const extra = buttonUrl
+            ? { reply_markup: { inline_keyboard: [[{ text: 'Open transaction', url: buttonUrl }]] } }
+            : undefined;
         await send(chatId, text, extra);
     } catch (e) {
-        if (e.code === 403) { delete state.subs[chatId]; delete state.settings[chatId]; dirty = true; }
-        else console.error('notify failed', chatId, e.message);
+        if (e.code === 403) {
+            delete state.subs[chatId];
+            delete state.settings[chatId];
+            dirty = true;
+        } else console.error('notify failed', chatId, e.message);
     }
 }
 
@@ -315,7 +358,10 @@ async function subscribe(chatId, input) {
     const display = det.non_bounceable.b64url;
     if (!state.addrs[key]) {
         let lastLt = '0';
-        try { const t = await ton('getTransactions', { address: raw, limit: 1 }); if (t.length) lastLt = t[0].transaction_id.lt; } catch (e) {}
+        try {
+            const t = await ton('getTransactions', { address: raw, limit: 1 });
+            if (t.length) lastLt = t[0].transaction_id.lt;
+        } catch (e) {}
         state.addrs[key] = { raw, lastLt };
     }
     state.subs[chatId] = state.subs[chatId] || {};
@@ -329,7 +375,10 @@ async function unsubscribe(chatId, keyOrNull) {
     if (!state.subs[chatId]) return 0;
     let count = 0;
     if (keyOrNull) {
-        if (state.subs[chatId][keyOrNull]) { delete state.subs[chatId][keyOrNull]; count = 1; }
+        if (state.subs[chatId][keyOrNull]) {
+            delete state.subs[chatId][keyOrNull];
+            count = 1;
+        }
     } else {
         count = Object.keys(state.subs[chatId]).length;
         delete state.subs[chatId];
@@ -340,29 +389,51 @@ async function unsubscribe(chatId, keyOrNull) {
 }
 
 const WELCOME =
-    '👋 <b>TON Wallet Notifier</b>\n📦 Version <b>2.1</b>\n\n' +
+    '👋 <b>TON Wallet Notifier</b>\n📦 Version <b>2.2</b>\n\n' +
     'Get instant alerts when TON is <b>received</b> or <b>sent</b> from your wallet.\n\n' +
     '📌 <b>How to use</b>\nJust send your wallet address (e.g. <code>UQ...</code>)\n\n' +
-    '✨ <b>Features</b>\n• 🔔 Real-time transaction alerts\n• 💰 Balance checker\n• 📈 Live TON price (USD + Toman) — send: تون or 1.5 تون\n' +
-    '• 💵 USD value display\n• 📤 Total withdrawn calculator\n• ⚙️ Min amount & direction filters\n• 📊 Daily summary\n• 🗑 Easy address management';
+    '✨ <b>Features</b>\n' +
+    '• 🔔 Fast real-time transaction alerts\n' +
+    '• 💰 Balance checker\n' +
+    '• 📈 Live TON price (USD + Toman) — send any number e.g. <code>2.5</code>\n' +
+    '• 💵 USD value display\n' +
+    '• 📤 Total withdrawn calculator\n' +
+    '• ⚙️ Min amount & direction filters\n' +
+    '• 📊 Daily summary\n' +
+    '• 🗑 Easy address management';
 
 async function doSubscribe(chatId, input) {
     try {
         const display = await subscribe(chatId, input);
-        await send(chatId, '✅ <b>Alerts activated!</b>\n\n👛 <code>' + esc(display) + '</code>\n\nYou will now receive notifications for every incoming and outgoing TON transaction.', { reply_markup: mainKeyboard() });
+        await send(
+            chatId,
+            '✅ <b>Alerts activated!</b>\n\n👛 <code>' + esc(display) + '</code>\n\nYou will now receive notifications for every incoming and outgoing TON transaction.',
+            { reply_markup: mainKeyboard() }
+        );
     } catch (e) {
-        if (e.message === 'TESTNET') await send(chatId, '❌ Testnet addresses are not supported.\nPlease send a <b>mainnet</b> address.');
-        else { console.error('subscribe failed', e.message); await send(chatId, '❌ Invalid address or temporary network issue.\nPlease try again.'); }
+        if (e.message === 'TESTNET') {
+            await send(chatId, '❌ Testnet addresses are not supported.\nPlease send a <b>mainnet</b> address.');
+        } else {
+            console.error('subscribe failed', e.message);
+            await send(chatId, '❌ Invalid address or temporary network issue.\nPlease try again.');
+        }
     }
 }
 
 async function showList(chatId) {
     const mine = state.subs[chatId] || {};
     const keys = Object.keys(mine);
-    if (!keys.length) return send(chatId, '📭 You have no active addresses yet.\n\nSend a wallet address to start receiving alerts.', { reply_markup: mainKeyboard() });
+    if (!keys.length) {
+        return send(chatId, '📭 You have no active addresses yet.\n\nSend a wallet address to start receiving alerts.', {
+            reply_markup: mainKeyboard()
+        });
+    }
     let text = '📋 <b>My Active Addresses</b> (' + keys.length + ')\n\n';
     const rows = [];
-    keys.forEach((key, i) => { text += (i + 1) + '. <code>' + esc(mine[key]) + '</code>\n\n'; rows.push([{ text: '🗑 Remove #' + (i + 1), callback_data: 'rm_' + key }]); });
+    keys.forEach((key, i) => {
+        text += (i + 1) + '. <code>' + esc(mine[key]) + '</code>\n\n';
+        rows.push([{ text: '🗑 Remove #' + (i + 1), callback_data: 'rm_' + key }]);
+    });
     rows.push([{ text: '« Back', callback_data: 'back_main' }]);
     return send(chatId, text, { reply_markup: { inline_keyboard: rows } });
 }
@@ -370,7 +441,9 @@ async function showList(chatId) {
 async function showBalances(chatId) {
     const mine = state.subs[chatId] || {};
     const keys = Object.keys(mine);
-    if (!keys.length) return send(chatId, '📭 No active addresses.\nSend a wallet address first.', { reply_markup: mainKeyboard() });
+    if (!keys.length) {
+        return send(chatId, '📭 No active addresses.\nSend a wallet address first.', { reply_markup: mainKeyboard() });
+    }
     await fetchTonPrice();
     let text = '💰 <b>Balances</b>\n';
     text += tonPriceUsd > 0 ? '📈 TON Price: <b>$' + tonPriceUsd.toFixed(4) + '</b> (Binance)\n\n' : '\n';
@@ -379,8 +452,10 @@ async function showBalances(chatId) {
             const bal = await ton('getAddressBalance', { address: state.addrs[key].raw });
             const tonAmt = nanoToNumber(bal);
             text += '👛 <code>' + esc(shortAddr(mine[key])) + '</code>\n   <b>' + formatTon(bal) + ' TON</b>' + usdStr(tonAmt) + '\n\n';
-        } catch (e) { text += '👛 <code>' + esc(shortAddr(mine[key])) + '</code>\n   ⚠️ Failed to fetch\n\n'; }
-        await sleep(300);
+        } catch (e) {
+            text += '👛 <code>' + esc(shortAddr(mine[key])) + '</code>\n   ⚠️ Failed to fetch\n\n';
+        }
+        await sleep(TONCENTER_API_KEY ? 80 : 250);
     }
     return send(chatId, text, { reply_markup: mainKeyboard() });
 }
@@ -388,7 +463,9 @@ async function showBalances(chatId) {
 async function showTotalWithdrawn(chatId) {
     const mine = state.subs[chatId] || {};
     const keys = Object.keys(mine);
-    if (!keys.length) return send(chatId, '📭 No active addresses.\nSend a wallet address first.', { reply_markup: mainKeyboard() });
+    if (!keys.length) {
+        return send(chatId, '📭 No active addresses.\nSend a wallet address first.', { reply_markup: mainKeyboard() });
+    }
     await fetchTonPrice();
     let text = '📤 <b>Total Withdrawn</b>\n';
     text += tonPriceUsd > 0 ? '📈 TON Price: <b>$' + tonPriceUsd.toFixed(4) + '</b>\n\n' : '\n';
@@ -407,8 +484,10 @@ async function showTotalWithdrawn(chatId) {
             }
             grandTotal += outSum;
             text += '👛 <code>' + esc(shortAddr(mine[key])) + '</code>\n   <b>−' + outSum.toFixed(4) + ' TON</b>' + usdStr(outSum) + '\n   <i>(last 50 txs)</i>\n\n';
-        } catch (e) { text += '👛 <code>' + esc(shortAddr(mine[key])) + '</code>\n   ⚠️ Failed to fetch\n\n'; }
-        await sleep(400);
+        } catch (e) {
+            text += '👛 <code>' + esc(shortAddr(mine[key])) + '</code>\n   ⚠️ Failed to fetch\n\n';
+        }
+        await sleep(TONCENTER_API_KEY ? 120 : 350);
     }
     text += '──────────────\n📊 <b>Grand Total: −' + grandTotal.toFixed(4) + ' TON</b>' + usdStr(grandTotal);
     return send(chatId, text, { reply_markup: mainKeyboard() });
@@ -416,7 +495,12 @@ async function showTotalWithdrawn(chatId) {
 
 async function showSettings(chatId) {
     const s = getSettings(chatId);
-    const text = '⚙️ <b>Settings</b>\n\n• Minimum amount: <b>' + s.minTon + ' TON</b>\n• Incoming only: <b>' + (s.onlyIn ? 'Yes' : 'No') + '</b>\n• Outgoing only: <b>' + (s.onlyOut ? 'Yes' : 'No') + '</b>\n\nTap the buttons below to change.';
+    const text =
+        '⚙️ <b>Settings</b>\n\n' +
+        '• Minimum amount: <b>' + s.minTon + ' TON</b>\n' +
+        '• Incoming only: <b>' + (s.onlyIn ? 'Yes' : 'No') + '</b>\n' +
+        '• Outgoing only: <b>' + (s.onlyOut ? 'Yes' : 'No') + '</b>\n\n' +
+        'Tap the buttons below to change.';
     return send(chatId, text, { reply_markup: settingsKeyboard(chatId) });
 }
 
@@ -431,9 +515,15 @@ async function handleCallback(cq) {
     if (data === 'stop_all') {
         const n = await unsubscribe(chatId, null);
         await answerCallback(cq.id, n ? 'Alerts stopped' : 'No active alerts');
-        return send(chatId, n ? '🔕 All alerts have been turned off.' : 'No active alerts found.', { reply_markup: mainKeyboard() });
+        return send(chatId, n ? '🔕 All alerts have been turned off.' : 'No active alerts found.', {
+            reply_markup: mainKeyboard()
+        });
     }
-    if (data === 'back_main') { await answerCallback(cq.id); return send(chatId, WELCOME, { reply_markup: mainKeyboard() }); }
+    if (data === 'back_main') {
+        awaitingMin.delete(String(chatId));
+        await answerCallback(cq.id);
+        return send(chatId, WELCOME, { reply_markup: mainKeyboard() });
+    }
     if (data.startsWith('rm_')) {
         const key = data.slice(3);
         const n = await unsubscribe(chatId, key);
@@ -441,17 +531,42 @@ async function handleCallback(cq) {
         return showList(chatId);
     }
     if (data === 'toggle_in') {
-        const s = getSettings(chatId); s.onlyIn = !s.onlyIn; if (s.onlyIn) s.onlyOut = false; dirty = true; await saveState();
+        const s = getSettings(chatId);
+        s.onlyIn = !s.onlyIn;
+        if (s.onlyIn) s.onlyOut = false;
+        dirty = true;
+        await saveState();
         await answerCallback(cq.id, s.onlyIn ? 'Incoming only enabled' : 'Incoming only disabled');
         return showSettings(chatId);
     }
     if (data === 'toggle_out') {
-        const s = getSettings(chatId); s.onlyOut = !s.onlyOut; if (s.onlyOut) s.onlyIn = false; dirty = true; await saveState();
+        const s = getSettings(chatId);
+        s.onlyOut = !s.onlyOut;
+        if (s.onlyOut) s.onlyIn = false;
+        dirty = true;
+        await saveState();
         await answerCallback(cq.id, s.onlyOut ? 'Outgoing only enabled' : 'Outgoing only disabled');
         return showSettings(chatId);
     }
-    if (data === 'set_min') { await answerCallback(cq.id); return send(chatId, 'Send the minimum TON amount (e.g. <code>0.1</code> or <code>0</code> to disable):\n\nReply with a number.'); }
+    if (data === 'set_min') {
+        awaitingMin.add(String(chatId));
+        await answerCallback(cq.id);
+        return send(
+            chatId,
+            'Send the minimum TON amount (e.g. <code>0.1</code> or <code>0</code> to disable).\n\nReply with a number only.'
+        );
+    }
     return answerCallback(cq.id);
+}
+
+/** Parse amount from free text: 2.5 / 1.5 تون / تون 3 / 2ton */
+function parseTonAmount(text) {
+    const t = String(text || '').trim();
+    let m = t.match(/^(\d+(?:[.,]\d+)?)\s*(?:تون|ton)?$/i);
+    if (m) return parseFloat(m[1].replace(',', '.'));
+    m = t.match(/^(?:تون|ton)\s*(\d+(?:[.,]\d+)?)$/i);
+    if (m) return parseFloat(m[1].replace(',', '.'));
+    return null;
 }
 
 async function handleMessage(msg) {
@@ -460,41 +575,77 @@ async function handleMessage(msg) {
     const text = (msg.text || '').trim();
     if (!text) return;
     const low = text.toLowerCase().trim();
-    // e.g. "1 تون", "1.5 ton", "2تون", "تون 3"
-    let amtParsed = null;
-    let m1 = text.trim().match(/^(\d+(?:\.\d+)?)\s*(?:تون|ton)$/i);
-    if (m1) amtParsed = parseFloat(m1[1]);
-    else {
-        let m2 = text.trim().match(/^(?:تون|ton)\s*(\d+(?:\.\d+)?)$/i);
-        if (m2) amtParsed = parseFloat(m2[1]);
-    }
-    if (amtParsed !== null && amtParsed > 0 && amtParsed < 1e12) {
-        return showTonPrice(chatId, amtParsed);
-    }
-    if (low === 'تون' || low === 'ton' || low === 'قیمت تون' || low === 'قیمت' || low === '/ton' || low === '/price') {
-        return showTonPrice(chatId);
-    }
-    if (/^\d+(\.\d+)?$/.test(text)) {
-        const val = parseFloat(text);
-        if (val >= 0 && val < 1000000) {
-            const s = getSettings(chatId); s.minTon = val; dirty = true; await saveState();
-            return send(chatId, '✅ Minimum amount set to <b>' + val + ' TON</b>', { reply_markup: mainKeyboard() });
+    const chatKey = String(chatId);
+
+    // Settings: waiting for min amount
+    if (awaitingMin.has(chatKey) && /^\d+([.,]\d+)?$/.test(text)) {
+        const val = parseFloat(text.replace(',', '.'));
+        if (val >= 0 && val < 1e6) {
+            awaitingMin.delete(chatKey);
+            const s = getSettings(chatId);
+            s.minTon = val;
+            dirty = true;
+            await saveState();
+            return send(chatId, '✅ Minimum amount set to <b>' + val + ' TON</b>', {
+                reply_markup: mainKeyboard()
+            });
         }
     }
+
+    // Any number / "x تون" → live price conversion (fast path)
+    const amtParsed = parseTonAmount(text);
+    if (
+        amtParsed !== null &&
+        amtParsed > 0 &&
+        amtParsed < 1e12 &&
+        !text.startsWith('/') &&
+        !/^[A-Za-z0-9_\-+\/=:]{40,70}$/.test(text)
+    ) {
+        // bare numbers and "N تون" both convert
+        if (/^\d+([.,]\d+)?$/.test(text) || /تون|ton/i.test(text)) {
+            return showTonPrice(chatId, amtParsed);
+        }
+    }
+
+    if (
+        low === 'تون' ||
+        low === 'ton' ||
+        low === 'قیمت تون' ||
+        low === 'قیمت' ||
+        low === '/ton' ||
+        low === '/price'
+    ) {
+        return showTonPrice(chatId);
+    }
+
     const parts = text.split(/\s+/);
     const cmd = parts[0].toLowerCase().split('@')[0];
     const arg = parts.slice(1).join(' ');
-    if (cmd === '/start') { if (arg) return doSubscribe(chatId, arg); return send(chatId, WELCOME, { reply_markup: mainKeyboard() }); }
+
+    if (cmd === '/start') {
+        if (arg) return doSubscribe(chatId, arg);
+        return send(chatId, WELCOME, { reply_markup: mainKeyboard() });
+    }
     if (cmd === '/help') return send(chatId, WELCOME, { reply_markup: mainKeyboard() });
     if (cmd === '/list') return showList(chatId);
     if (cmd === '/balance' || cmd === '/balances') return showBalances(chatId);
     if (cmd === '/settings') return showSettings(chatId);
     if (cmd === '/stop') {
-        try { const n = await unsubscribe(chatId, null); return send(chatId, n ? '🔕 All alerts have been turned off.' : 'No active alerts found.', { reply_markup: mainKeyboard() }); }
-        catch (e) { return send(chatId, '❌ Something went wrong.'); }
+        try {
+            const n = await unsubscribe(chatId, null);
+            return send(chatId, n ? '🔕 All alerts have been turned off.' : 'No active alerts found.', {
+                reply_markup: mainKeyboard()
+            });
+        } catch (e) {
+            return send(chatId, '❌ Something went wrong.');
+        }
     }
+
     if (/^[A-Za-z0-9_\-+\/=:]{40,70}$/.test(text)) return doSubscribe(chatId, text);
-    return send(chatId, 'Please send a TON wallet address or use the buttons below.', { reply_markup: mainKeyboard() });
+
+    return send(chatId, 'Please send a TON wallet address, a number for price, or use the buttons below.', {
+        reply_markup: mainKeyboard()
+    });
 }
 
 async function checkDailySummaries() {
@@ -502,13 +653,24 @@ async function checkDailySummaries() {
     for (const chatId of Object.keys(state.subs)) {
         const s = getSettings(chatId);
         if (s.lastDaily === today) continue;
-        if (s.dayIn === 0 && s.dayOut === 0) { s.lastDaily = today; continue; }
+        if (s.dayIn === 0 && s.dayOut === 0) {
+            s.lastDaily = today;
+            continue;
+        }
         await fetchTonPrice();
-        const text = '📊 <b>Daily Summary</b> (' + today + ')\n\n🟢 Received: <b>+' + s.dayIn.toFixed(4) + ' TON</b>' + usdStr(s.dayIn) +
+        const text =
+            '📊 <b>Daily Summary</b> (' + today + ')\n\n' +
+            '🟢 Received: <b>+' + s.dayIn.toFixed(4) + ' TON</b>' + usdStr(s.dayIn) +
             '\n🔴 Sent: <b>−' + s.dayOut.toFixed(4) + ' TON</b>' + usdStr(s.dayOut) +
-            '\n📈 Net: <b>' + (s.dayIn - s.dayOut >= 0 ? '+' : '') + (s.dayIn - s.dayOut).toFixed(4) + ' TON</b>';
+            '\n📈 Net: <b>' +
+            (s.dayIn - s.dayOut >= 0 ? '+' : '') +
+            (s.dayIn - s.dayOut).toFixed(4) +
+            ' TON</b>';
         await notify(chatId, text);
-        s.dayIn = 0; s.dayOut = 0; s.lastDaily = today; dirty = true;
+        s.dayIn = 0;
+        s.dayOut = 0;
+        s.lastDaily = today;
+        dirty = true;
     }
     if (dirty) await saveState();
 }
@@ -517,39 +679,85 @@ async function updatesLoop() {
     let offset = 0;
     for (;;) {
         try {
-            const updates = await tg('getUpdates', { offset, timeout: 50, allowed_updates: ['message', 'callback_query'] });
+            const updates = await tg('getUpdates', {
+                offset,
+                timeout: 50,
+                allowed_updates: ['message', 'callback_query']
+            });
             for (const u of updates) {
                 offset = u.update_id + 1;
                 if (u.message) handleMessage(u.message).catch(e => console.error('handler error', e.message));
-                else if (u.callback_query) handleCallback(u.callback_query).catch(e => console.error('callback error', e.message));
+                else if (u.callback_query) {
+                    handleCallback(u.callback_query).catch(e => console.error('callback error', e.message));
+                }
             }
-        } catch (e) { console.error('getUpdates error', e.message); await sleep(3000); }
+        } catch (e) {
+            console.error('getUpdates error', e.message);
+            await sleep(2000);
+        }
     }
 }
 
-async function pollOnce() {
-    const keys = Object.keys(state.addrs);
-    for (const key of keys) {
-        const a = state.addrs[key];
-        if (!a) continue;
-        const chats = Object.keys(state.subs).filter(c => state.subs[c] && state.subs[c][key]);
-        if (!chats.length) { delete state.addrs[key]; dirty = true; continue; }
-        try {
-            const txs = await ton('getTransactions', { address: a.raw, limit: 15 });
-            const last = BigInt(a.lastLt || '0');
-            const fresh = txs.filter(t => BigInt(t.transaction_id.lt) > last).sort((x, y) => BigInt(x.transaction_id.lt) < BigInt(y.transaction_id.lt) ? -1 : 1);
-            for (const tx of fresh) {
-                for (const chatId of chats) {
-                    if (!state.subs[chatId]) continue;
-                    const msgs = buildMessages(tx, state.subs[chatId][key], chatId);
-                    for (const m of msgs) await notify(chatId, m.text, m.url);
-                }
-                a.lastLt = tx.transaction_id.lt; dirty = true;
-            }
-        } catch (e) { console.error('poll error', key, e.message); }
-        await sleep(TONCENTER_API_KEY ? 150 : 1000);
+async function pollAddress(key) {
+    const a = state.addrs[key];
+    if (!a) return;
+    const chats = Object.keys(state.subs).filter(c => state.subs[c] && state.subs[c][key]);
+    if (!chats.length) {
+        delete state.addrs[key];
+        dirty = true;
+        return;
     }
-    if (dirty) { dirty = false; await saveState(); }
+    try {
+        // smaller limit = faster response
+        const txs = await ton('getTransactions', { address: a.raw, limit: 10 });
+        const last = BigInt(a.lastLt || '0');
+        const fresh = txs
+            .filter(t => BigInt(t.transaction_id.lt) > last)
+            .sort((x, y) => (BigInt(x.transaction_id.lt) < BigInt(y.transaction_id.lt) ? -1 : 1));
+        for (const tx of fresh) {
+            for (const chatId of chats) {
+                if (!state.subs[chatId]) continue;
+                const msgs = buildMessages(tx, state.subs[chatId][key], chatId);
+                for (const m of msgs) await notify(chatId, m.text, m.url);
+            }
+            a.lastLt = tx.transaction_id.lt;
+            dirty = true;
+        }
+    } catch (e) {
+        console.error('poll error', key, e.message);
+    }
+}
+
+async function mapPool(items, concurrency, fn) {
+    const queue = items.slice();
+    const workers = [];
+    for (let i = 0; i < concurrency; i++) {
+        workers.push(
+            (async () => {
+                while (queue.length) {
+                    const item = queue.shift();
+                    if (item === undefined) break;
+                    await fn(item);
+                }
+            })()
+        );
+    }
+    await Promise.all(workers);
+}
+
+async function pollOnce() {
+    // keep price warm so alerts show USD quickly
+    fetchTonPrice().catch(() => {});
+    const keys = Object.keys(state.addrs);
+    await mapPool(keys, POLL_CONCURRENCY, async key => {
+        await pollAddress(key);
+        // tiny gap only when no API key
+        if (!TONCENTER_API_KEY) await sleep(200);
+    });
+    if (dirty) {
+        dirty = false;
+        await saveState();
+    }
 }
 
 async function pollLoop() {
@@ -558,24 +766,41 @@ async function pollLoop() {
         const t0 = Date.now();
         try {
             await pollOnce();
-            if (Date.now() - lastDailyCheck > 30 * 60 * 1000) { await checkDailySummaries(); lastDailyCheck = Date.now(); }
-        } catch (e) { console.error('pollOnce error', e.message); }
-        await sleep(Math.max(500, POLL_MS - (Date.now() - t0)));
+            if (Date.now() - lastDailyCheck > 30 * 60 * 1000) {
+                await checkDailySummaries();
+                lastDailyCheck = Date.now();
+            }
+        } catch (e) {
+            console.error('pollOnce error', e.message);
+        }
+        const elapsed = Date.now() - t0;
+        await sleep(Math.max(200, POLL_MS - elapsed));
     }
 }
 
 async function main() {
-    if (!BOT_TOKEN) { console.error('BOT_TOKEN is not set'); process.exit(1); }
+    if (!BOT_TOKEN) {
+        console.error('BOT_TOKEN is not set');
+        process.exit(1);
+    }
     await loadState();
-    await fetchTonPrice();
-    http.createServer((req, res) => { res.writeHead(200); res.end('ok'); }).listen(PORT);
+    await fetchTonPrice(true);
+    http.createServer((req, res) => {
+        res.writeHead(200);
+        res.end('ok');
+    }).listen(PORT);
     await tg('deleteWebhook', {}).catch(() => {});
     const me = await tg('getMe');
-    console.log('Bot started: @' + me.username + ' | storage: ' + (FIREBASE_DB_URL ? 'firebase' : 'file') + ' | TON price: $' + tonPriceUsd);
+    console.log(
+        'Bot started: @' + me.username +
+        ' | storage: ' + (FIREBASE_DB_URL ? 'firebase' : 'file') +
+        ' | poll: ' + POLL_MS + 'ms x' + POLL_CONCURRENCY +
+        ' | TON: $' + tonPriceUsd
+    );
     updatesLoop();
     pollLoop();
 }
 
 process.on('unhandledRejection', e => console.error('unhandledRejection', e));
 if (require.main === module) main().catch(e => { console.error(e); process.exit(1); });
-else module.exports = { buildMessages, formatTon };
+else module.exports = { buildMessages, formatTon, parseTonAmount };
